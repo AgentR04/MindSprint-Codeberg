@@ -1,55 +1,60 @@
-import 'dotenv/config'
-import express from 'express'
-import http from 'http'
-import cors from 'cors'
-import helmet from 'helmet'
-import morgan from 'morgan'
-import rateLimit from 'express-rate-limit'
-import { Server } from 'socket.io'
-import { connectDB } from './config/db.js'
-import authRoutes from './routes/authRoutes.js'
-import doctorRoutes from './routes/doctorRoutes.js'
-import prescriptionRoutes from './routes/prescriptionRoutes.js'
-import medicineRoutes from './routes/medicineRoutes.js'
-import analyticsRoutes from './routes/analyticsRoutes.js'
-import chatRoutes from './routes/chatRoutes.js'
-import { notFound, errorHandler } from './middleware/error.js'
-import { auth } from './middleware/auth.js'
-import { Message } from './models/Message.js'
+// server.js
+const express = require("express");
+const cors = require("cors");
+const bodyParser = require("body-parser");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 
-await connectDB()
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
 
-const app = express()
-app.use(cors({ origin: process.env.CLIENT_URL||'*', credentials: true }))
-app.use(helmet())
-app.use(express.json({limit:'2mb'}))
-app.use(morgan('dev'))
-app.use(rateLimit({windowMs: 60_000, max: 120}))
-app.use('/uploads', express.static('backend/uploads'))
+const genAI = new GoogleGenerativeAI(process.env.gemini_api_key);
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-app.use('/api/auth', authRoutes)
-app.use('/api/doctors', doctorRoutes)
-app.use('/api/prescriptions', prescriptionRoutes)
-app.use('/api/medicines', medicineRoutes)
-app.use('/api/analytics', analyticsRoutes)
-app.use('/api/chat', chatRoutes)
+app.post("/api/mealplan", async (req, res) => {
+  try {
+    const userProfile = req.body;
 
-app.get('/api/me', auth, (req,res)=> res.json({id:req.user._id,name:req.user.name,role:req.user.role,doctorApproved:req.user.doctorApproved}))
+    const prompt = `
+You are a meal planning assistant.
+Generate a 7-day meal plan with breakfast, lunch, dinner, and one snack per day.
+Respect these constraints: ${JSON.stringify(userProfile)}.
+Return ONLY valid JSON. Do not include explanations or markdown fences.
+Schema:
+{
+  "days": [...],
+  "shopping_list": [...]
+}
+`;
 
-app.use(notFound)
-app.use(errorHandler)
+    const result = await model.generateContent(prompt);
+    let text = result.response.text();
 
-const server = http.createServer(app)
-const io = new Server(server, { cors: { origin: process.env.CLIENT_URL||'*' } })
+    // 🧹 Remove common junk (markdown fences, "json", trailing notes)
+    text = text
+      .replace(/```json/g, "")
+      .replace(/```/g, "")
+      .trim();
 
-io.on('connection', socket => {
-  socket.on('join', room => { socket.join(room) })
-  socket.on('typing', ({room, user}) => socket.to(room).emit('typing', {user}))
-  socket.on('message', async ({room, from, to, body}) => {
-    const msg = await Message.create({room,from,to,body})
-    io.to(room).emit('message', msg)
-  })
-})
+    // ✅ Extract only the first JSON object
+    const firstCurly = text.indexOf("{");
+    const lastCurly = text.lastIndexOf("}");
+    if (firstCurly === -1 || lastCurly === -1) {
+      throw new Error("No JSON object found in response");
+    }
 
-const port = process.env.PORT || 5000
-server.listen(port, ()=> console.log('server_running_'+port))
+    const jsonString = text.substring(firstCurly, lastCurly + 1);
+
+    const json = JSON.parse(jsonString);
+
+    res.json({ plan: json });
+  } catch (err) {
+    console.error("Backend error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+app.listen(5000, () =>
+  console.log("✅ Backend running on http://localhost:5000")
+);
